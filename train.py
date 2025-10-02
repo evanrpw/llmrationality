@@ -38,12 +38,41 @@ class CoherenceDataset(Dataset):
         messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": f'Statement: "{text}"\nIs the statement true or false? Please answer in a single word, either True or False, with no other output.'},
-            {"role": "assistant", "content": 'The statement is '}
+            # {"role": "assistant", "content": 'The statement is '}
         ]
         return self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
     
+    def compute_original_confidences(self, model):
+        """Compute original model confidence scores for statements and negations"""
+        model.eval()
+        device = next(model.parameters()).device
+        
+        for idx in range(len(self.pairs)):
+            pair = self.pairs[idx]
+            statement_prompt = self._create_prompt(pair['statement'])
+            negation_prompt = self._create_prompt(pair['negation'])
+            
+            statement_encoding = create_tokenized_encoding(self.tokenizer, statement_prompt, self.max_length)
+            negation_encoding = create_tokenized_encoding(self.tokenizer, negation_prompt, self.max_length)
+            
+            # Move to device
+            statement_input_ids = statement_encoding['input_ids'].to(device)
+            statement_attention_mask = statement_encoding['attention_mask'].to(device)
+            negation_input_ids = negation_encoding['input_ids'].to(device)
+            negation_attention_mask = negation_encoding['attention_mask'].to(device)
+            
+            with torch.no_grad():
+                stmt_true_prob, _, _ = get_true_false_probabilities(
+                    model, self.tokenizer, statement_input_ids, statement_attention_mask
+                )
+                neg_true_prob, _, _ = get_true_false_probabilities(
+                    model, self.tokenizer, negation_input_ids, negation_attention_mask
+                )
+            
+            pair['original_confidence'] = stmt_true_prob / (stmt_true_prob + neg_true_prob)
+
     def __getitem__(self, idx):
         pair = self.pairs[idx]
         
@@ -62,7 +91,8 @@ class CoherenceDataset(Dataset):
             'negation_attention_mask': negation_encoding['attention_mask'].squeeze(),
             'item_id': pair['item_id'],
             'statement_text': pair['statement'],
-            'negation_text': pair['negation']
+            'negation_text': pair['negation'],
+            'original_confidence': pair['original_confidence']
         }
 
 
@@ -75,7 +105,8 @@ def collate_fn(batch):
         'negation_attention_mask': torch.stack([item['negation_attention_mask'] for item in batch]),
         'item_id': [item['item_id'] for item in batch],
         'statement_text': [item['statement_text'] for item in batch],
-        'negation_text': [item['negation_text'] for item in batch]
+        'negation_text': [item['negation_text'] for item in batch],
+        'original_confidence': torch.tensor([item['original_confidence'] for item in batch])
     }
 
 
@@ -275,7 +306,7 @@ def normalize_probabilities(statement_true_probs, negation_true_probs, use_softm
         # Higher temperature = softer targets?
         # Lower temperature = harder targets?
         coherence_probs = F.softmax(
-            torch.stack([statement_true_probs, negation_true_probs], dim=1) / temperature, 
+            torch.log(torch.stack([statement_true_probs, negation_true_probs], dim=1)) / temperature, 
             dim=1
         )
         normalized_statement_prob = coherence_probs[:, 0]
@@ -323,22 +354,30 @@ def smooth_crossentropy_loss(model, tokenizer, batch, use_softmax=True, temperat
         batch['negation_attention_mask']
     )
     
-    # Step 1: Normalize probabilities using selected method
-    normalized_statement_prob, normalized_negation_prob = normalize_probabilities(
-        statement_true_probs, negation_true_probs, use_softmax, temperature
-    )
+    # # Step 1: Normalize probabilities using selected method
+    # normalized_statement_prob, normalized_negation_prob = normalize_probabilities(
+    #     statement_true_probs, negation_true_probs, use_softmax, temperature
+    # )
+
+    # Step 1: Take normalized original confidence as training target
+    normalized_statement_prob = batch['original_confidence'].to(statement_logits.device)
     
     # Step 2: Create soft target distributions; ANCHOR ON TRUE
     # For statement: [normalized_statement_prob, 1 - normalized_statement_prob]
-    # For negation: [normalized_negation_prob, 1 - normalized_negation_prob]
+    # # For negation: [normalized_negation_prob, 1 - normalized_negation_prob]
+    # For negation: [1 - normalized_statement_prob, normalized_statement_prob]
     statement_targets = torch.stack([
         normalized_statement_prob,  # P(True)
         1.0 - normalized_statement_prob  # P(False)
     ], dim=1)
     
+    # negation_targets = torch.stack([
+    #     normalized_negation_prob,   # P(True)  
+    #     1.0 - normalized_negation_prob  # P(False)
+    # ], dim=1)
     negation_targets = torch.stack([
-        normalized_negation_prob,   # P(True)  
-        1.0 - normalized_negation_prob  # P(False)
+        1.0 - normalized_statement_prob,
+        normalized_statement_prob
     ], dim=1)
     
     # Step 3: Get model's current True/False distributions
@@ -555,6 +594,7 @@ def main():
     
     # Create dataset and dataloader
     dataset = CoherenceDataset(config["data_path"], tokenizer)
+    dataset.compute_original_confidences(model)
     dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True, collate_fn=collate_fn)
     
     print(f"Dataset size: {len(dataset)} pairs")

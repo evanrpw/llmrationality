@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 class CoherenceDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_length=512):
+    def __init__(self, data_path, tokenizer, max_length=512, split='train', val_split=0.2, random_seed=42):
         self.tokenizer = tokenizer
         self.max_length = max_length
         
@@ -22,13 +22,27 @@ class CoherenceDataset(Dataset):
             data = json.load(f)
         
         # Keep pairs together - each item contains both statement and negation
-        self.pairs = []
+        all_pairs = []
         for item in data:
-            self.pairs.append({
+            all_pairs.append({
                 'statement': item['proposition_correct_answer'],
                 'negation': item['negation_correct_answer'],
                 'item_id': item['id']
             })
+        
+        # Split data into train/validation
+        import random
+        random.seed(random_seed)
+        random.shuffle(all_pairs)
+        
+        split_idx = int(len(all_pairs) * (1 - val_split))
+        
+        if split == 'train':
+            self.pairs = all_pairs[:split_idx]
+        elif split == 'val':
+            self.pairs = all_pairs[split_idx:]
+        else:
+            raise ValueError(f"Split must be 'train' or 'val', got {split}")
     
     def __len__(self):
         return len(self.pairs)
@@ -205,7 +219,7 @@ def log_eval_metrics(metrics, epoch, improvement=None, wandb_enabled=False):
         log_data["eval/improvement"] = improvement
     
     # Create scatterplot if we have the data
-    if 'statement_prob_true' in metrics and 'negation_prob_true' in metrics:
+    if (epoch % 4 == 0) and 'statement_prob_true' in metrics and 'negation_prob_true' in metrics:
         # Create scatterplot data
         scatter_data = []
         for p_stmt, p_neg in zip(metrics['statement_prob_true'], metrics['negation_prob_true']):
@@ -517,7 +531,7 @@ def evaluate_coherence(model, tokenizer, dataset, batch_size=4):
 
 def main():
     parser = argparse.ArgumentParser(description="Coherence Fine-tuning with paired data")
-    parser.add_argument("--data_path", type=str, default="smallsampledataset.json", help="Path to training data")
+    parser.add_argument("--data_path", type=str, default="dataset.json", help="Path to training data")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
@@ -531,6 +545,11 @@ def main():
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--auto_resume", action="store_true", help="Automatically resume from latest checkpoint")
     
+    # Data split arguments
+    parser.add_argument("--val_split", type=float, default=0.2, help="Fraction of data to use for validation")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed for data splitting")
+    parser.add_argument("--eval_train", action="store_true", help="Also evaluate on training set each epoch (for debugging overfitting)")
+    
     # Loss function arguments
     parser.add_argument("--loss_type", type=str, default="mse", choices=["mse", "smooth_xent"], 
                        help="Loss function type: 'mse' for MSE on probability sums, 'smooth_xent' for smooth cross-entropy")
@@ -539,6 +558,12 @@ def main():
     parser.add_argument("--use_softmax", action="store_true", 
                        help="Use softmax normalization instead of manual division. Softmax flattens differences but respects temperature, manual division preserves ratios exactly")
     args = parser.parse_args()
+    
+    # Validate arguments
+    if not (0.0 < args.val_split < 1.0):
+        raise ValueError(f"val_split must be between 0 and 1, got {args.val_split}")
+    if args.temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {args.temperature}")
     
     # Configuration
     model_name = "meta-llama/Llama-3.1-8B-Instruct"
@@ -552,6 +577,8 @@ def main():
         "loss_type": args.loss_type,
         "temperature": args.temperature,
         "use_softmax": args.use_softmax,
+        "val_split": args.val_split,
+        "random_seed": args.random_seed,
         "lora_r": 16,
         "lora_alpha": 32,
         "lora_dropout": 0.1,
@@ -592,12 +619,21 @@ def main():
     )
     model = get_peft_model(model, lora_config)
     
-    # Create dataset and dataloader
-    dataset = CoherenceDataset(config["data_path"], tokenizer)
-    dataset.compute_original_confidences(model)
-    dataloader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True, collate_fn=collate_fn)
+    # Create datasets and dataloaders
+    train_dataset = CoherenceDataset(config["data_path"], tokenizer, split='train', 
+                                   val_split=config["val_split"], random_seed=config["random_seed"])
+    val_dataset = CoherenceDataset(config["data_path"], tokenizer, split='val', 
+                                 val_split=config["val_split"], random_seed=config["random_seed"])
     
-    print(f"Dataset size: {len(dataset)} pairs")
+    # Compute original confidences for both datasets
+    train_dataset.compute_original_confidences(model)
+    val_dataset.compute_original_confidences(model)
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, collate_fn=collate_fn)
+    val_dataloader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, collate_fn=collate_fn)
+    
+    print(f"Training dataset size: {len(train_dataset)} pairs")
+    print(f"Validation dataset size: {len(val_dataset)} pairs")
     print(f"Loss type: {config['loss_type']}")
     if config['loss_type'] == 'smooth_xent':
         norm_method = "softmax" if config['use_softmax'] else "manual division"
@@ -649,8 +685,8 @@ def main():
     
     # Evaluate baseline (only if not resuming or no saved baseline)
     if baseline_metrics is None:
-        print("Evaluating baseline...")
-        baseline_metrics = evaluate_coherence(model, tokenizer, dataset)
+        print("Evaluating baseline on validation set...")
+        baseline_metrics = evaluate_coherence(model, tokenizer, val_dataset)
         print(f"Baseline mean violation: {baseline_metrics['mean_violation']:.4f}")
         print(f"Baseline mean sum: {baseline_metrics['mean_sum']:.4f}")
         
@@ -660,7 +696,7 @@ def main():
         # Log baseline metrics to wandb
         if args.use_wandb:
             log_eval_metrics(baseline_metrics, epoch=0, improvement=0.0, wandb_enabled=True)
-            wandb.log({"dataset_size": len(dataset)})
+            wandb.log({"train_dataset_size": len(train_dataset), "val_dataset_size": len(val_dataset)})
     else:
         print(f"Using saved baseline - Mean violation: {baseline_metrics['mean_violation']:.4f}")
     
@@ -676,7 +712,7 @@ def main():
             total_loss = 0
             num_batches = 0
             
-            for batch_idx, batch in enumerate(dataloader):
+            for batch_idx, batch in enumerate(train_dataloader):
                 # Move to device using helper function
                 batch = move_batch_to_device(batch, device)
                 
@@ -715,7 +751,12 @@ def main():
             
             # Evaluate after each epoch
             model.eval()
-            epoch_metrics = evaluate_coherence(model, tokenizer, dataset)
+            epoch_metrics = evaluate_coherence(model, tokenizer, val_dataset)
+            
+            # Optionally also evaluate on training set for overfitting detection
+            if args.eval_train:
+                train_metrics = evaluate_coherence(model, tokenizer, train_dataset)
+            
             model.train()
             
             # Store epoch metrics
@@ -725,11 +766,28 @@ def main():
             
             # Log epoch metrics to wandb
             if args.use_wandb:
-                wandb.log({"train/avg_loss": avg_loss})
+                log_dict = {
+                    "train/avg_loss": avg_loss,
+                }
+                if args.eval_train:
+                    log_dict.update({
+                        "train/mean_violation": train_metrics['mean_violation'],
+                        "train/mean_sum": train_metrics['mean_sum'],
+                        "overfitting/violation_gap": train_metrics['mean_violation'] - epoch_metrics['mean_violation'],
+                        "overfitting/sum_gap": train_metrics['mean_sum'] - epoch_metrics['mean_sum']
+                    })
+                wandb.log(log_dict)
                 log_eval_metrics(epoch_metrics, epoch=epoch + 1, improvement=improvement, wandb_enabled=True)
             
-            print(f"Epoch {epoch+1} eval - Mean violation: {epoch_metrics['mean_violation']:.4f}, "
+            print(f"Epoch {epoch+1} validation - Mean violation: {epoch_metrics['mean_violation']:.4f}, "
                   f"Mean sum: {epoch_metrics['mean_sum']:.4f}, Improvement: {improvement:.4f}")
+            
+            if args.eval_train:
+                train_improvement = baseline_metrics['mean_violation'] - train_metrics['mean_violation']
+                violation_gap = train_metrics['mean_violation'] - epoch_metrics['mean_violation']
+                print(f"Epoch {epoch+1} training   - Mean violation: {train_metrics['mean_violation']:.4f}, "
+                      f"Mean sum: {train_metrics['mean_sum']:.4f}, Improvement: {train_improvement:.4f}")
+                print(f"Overfitting gap: {violation_gap:.4f} (negative = overfitting)")
             
             # Save checkpoint
             if (epoch + 1) % args.save_every == 0 or (epoch + 1) == config["num_epochs"]:
@@ -748,9 +806,9 @@ def main():
                         f.write(wandb.run.id)
     
     ''' dont need this since we eval after every epoch
-    # Final evaluation
-    print("Evaluating final model...")
-    final_metrics = evaluate_coherence(model, tokenizer, dataset)
+    # Final evaluation on validation set
+    print("Evaluating final model on validation set...")
+    final_metrics = evaluate_coherence(model, tokenizer, val_dataset)
     final_improvement = baseline_metrics['mean_violation'] - final_metrics['mean_violation']
     
     # Store final metrics

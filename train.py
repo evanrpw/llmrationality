@@ -202,21 +202,21 @@ def find_latest_checkpoint(checkpoint_dir):
     return None
 
 
-def log_eval_metrics(metrics, epoch, improvement=None, wandb_enabled=False):
+def log_eval_metrics(metrics, epoch, improvement=None, wandb_enabled=False, prefix="eval"):
     """Log evaluation metrics to wandb with consistent naming"""
     if not wandb_enabled:
         return
     
     log_data = {
-        "eval/mean_violation": metrics['mean_violation'],
-        "eval/max_violation": metrics['max_violation'],
-        "eval/median_violation": metrics['median_violation'],
-        "eval/mean_sum": metrics['mean_sum'],
+        f"{prefix}/mean_violation": metrics['mean_violation'],
+        f"{prefix}/max_violation": metrics['max_violation'],
+        f"{prefix}/median_violation": metrics['median_violation'],
+        f"{prefix}/mean_sum": metrics['mean_sum'],
         "epoch": epoch
     }
     
     if improvement is not None:
-        log_data["eval/improvement"] = improvement
+        log_data[f"{prefix}/improvement"] = improvement
     
     # Create scatterplot if we have the data
     if (epoch % 4 == 0) and 'statement_prob_true' in metrics and 'negation_prob_true' in metrics:
@@ -231,11 +231,12 @@ def log_eval_metrics(metrics, epoch, improvement=None, wandb_enabled=False):
             columns=["P(Statement=True)", "P(Negation=True)"]
         )
         
-        log_data[f"eval/coherence_scatterplot_epoch_{epoch}"] = wandb.plot.scatter(
+        dataset_type = "Validation" if prefix == "eval" else "Training"
+        log_data[f"{prefix}/coherence_scatterplot_epoch_{epoch}"] = wandb.plot.scatter(
             scatter_table, 
             "P(Statement=True)", 
             "P(Negation=True)",
-            title=f"Coherence: P(Statement=True) vs P(Negation=True) (Epoch {epoch})"
+            title=f"Coherence: P(Statement=True) vs P(Negation=True) ({dataset_type} Set, Epoch {epoch})"
         )
         
     wandb.log(log_data)
@@ -255,11 +256,14 @@ def get_true_false_probabilities(model, tokenizer, input_ids, attention_mask):
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     logits = outputs.logits
     
-    # Get last token logits
-    seq_lengths = attention_mask.sum(dim=1) - 1
-    batch_indices = torch.arange(logits.size(0), device=logits.device)
-    last_token_logits = logits[batch_indices, seq_lengths, :]
+    # Get last token logits (padding is on left, so last token is at position -1)
+    last_token_logits = logits[:, -1, :]  # Shape: [batch_size, vocab_size]
     
+    # seq_lengths = attention_mask.sum(dim=1) - 1
+    # batch_indices = torch.arange(logits.size(0), device=logits.device)
+    # last_token_logits = logits[batch_indices, seq_lengths, :]
+    
+
     # Get True/False token IDs
     true_token_id = tokenizer.encode('True', add_special_tokens=False)[0]
     false_token_id = tokenizer.encode('False', add_special_tokens=False)[0]
@@ -777,7 +781,14 @@ def main():
                         "overfitting/sum_gap": train_metrics['mean_sum'] - epoch_metrics['mean_sum']
                     })
                 wandb.log(log_dict)
+                
+                # Log validation metrics with full visualizations
                 log_eval_metrics(epoch_metrics, epoch=epoch + 1, improvement=improvement, wandb_enabled=True)
+                
+                # Also log training metrics with visualizations if eval_train is enabled
+                if args.eval_train:
+                    train_improvement = baseline_metrics['mean_violation'] - train_metrics['mean_violation']
+                    log_eval_metrics(train_metrics, epoch=epoch + 1, improvement=train_improvement, wandb_enabled=True, prefix="train_eval")
             
             print(f"Epoch {epoch+1} validation - Mean violation: {epoch_metrics['mean_violation']:.4f}, "
                   f"Mean sum: {epoch_metrics['mean_sum']:.4f}, Improvement: {improvement:.4f}")

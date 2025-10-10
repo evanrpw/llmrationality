@@ -599,7 +599,7 @@ def main():
             print(f"Auto-resuming from: {resume_checkpoint}")
     
     print("Loading model and tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
+    tokenizer = AutoTokenizer.from_pretrained(config["model_name"], padding_side='left')
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     

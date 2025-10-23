@@ -542,7 +542,8 @@ def main():
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, default="coherence-training", help="wandb project name")
     parser.add_argument("--wandb_name", type=str, default=None, help="wandb run name")
-    
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="Model name")
+
     # Checkpoint arguments
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save_every", type=int, default=1, help="Save checkpoint every N epochs")
@@ -570,8 +571,8 @@ def main():
         raise ValueError(f"temperature must be positive, got {args.temperature}")
     
     # Configuration
-    model_name = "meta-llama/Llama-3.1-8B-Instruct"
-    
+    model_name = args.model_name
+
     config = {
         "model_name": model_name,
         "data_path": args.data_path,

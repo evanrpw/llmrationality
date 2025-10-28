@@ -532,6 +532,21 @@ def evaluate_coherence(model, tokenizer, dataset, batch_size=4):
         'negation_prob_true': negation_prob_true
     }
 
+def smart_bool(v):
+    
+    """Fix to allow wandb hyperparam sweeps (which use explicit true/false)
+    Parse boolean arguments that can be either flags (--use_wandb) or explicit values (--use_wandb=true)"""
+    if v is None or v == '':
+        return True  # Flag style: --use_wandb (no value provided)
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError(f'Boolean value expected, got: {v}')
+
 
 def main():
     parser = argparse.ArgumentParser(description="Coherence Fine-tuning with paired data")
@@ -539,7 +554,15 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
-    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases logging")
+    
+    # Boolean arguments that work with both manual flags and sweep explicit values
+    parser.add_argument("--use_wandb", type=smart_bool, nargs='?', const=True, default=False, 
+                       help="Use Weights & Biases logging")
+    parser.add_argument("--eval_train", type=smart_bool, nargs='?', const=True, default=False,
+                       help="Also evaluate on training set each epoch (for debugging overfitting)")
+    parser.add_argument("--use_softmax", type=smart_bool, nargs='?', const=True, default=False,
+                       help="Use softmax normalization instead of manual division")
+    
     parser.add_argument("--wandb_project", type=str, default="coherence-training", help="wandb project name")
     parser.add_argument("--wandb_name", type=str, default=None, help="wandb run name")
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="Model name")
@@ -553,15 +576,25 @@ def main():
     # Data split arguments
     parser.add_argument("--val_split", type=float, default=0.2, help="Fraction of data to use for validation")
     parser.add_argument("--random_seed", type=int, default=42, help="Random seed for data splitting")
-    parser.add_argument("--eval_train", action="store_true", help="Also evaluate on training set each epoch (for debugging overfitting)")
     
     # Loss function arguments
     parser.add_argument("--loss_type", type=str, default="mse", choices=["mse", "smooth_xent"], 
                        help="Loss function type: 'mse' for MSE on probability sums, 'smooth_xent' for smooth cross-entropy")
     parser.add_argument("--temperature", type=float, default=2.0, 
-                       help="Temperature for softmax normalization (higher = softer targets, preserves confidence; only used with --use_softmax)")
-    parser.add_argument("--use_softmax", action="store_true", 
-                       help="Use softmax normalization instead of manual division. Softmax flattens differences but respects temperature, manual division preserves ratios exactly")
+                       help="Temperature for softmax normalization (higher = softer targets, preserves confidence)")
+    
+    # LoRA hyperparameters (for sweep tuning)
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank parameter")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha parameter")
+    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout rate")
+    
+    # Model parameters
+    parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length for tokenization")
+    
+    # Additional loss function parameters (for future use)
+    parser.add_argument("--entropy_weight", type=float, default=0.0, help="Weight for entropy regularization")
+    parser.add_argument("--target_epsilon", type=float, default=0.1, help="Target epsilon for regularization")
+
     args = parser.parse_args()
     
     # Validate arguments
@@ -584,10 +617,13 @@ def main():
         "use_softmax": args.use_softmax,
         "val_split": args.val_split,
         "random_seed": args.random_seed,
-        "lora_r": 16,
-        "lora_alpha": 32,
-        "lora_dropout": 0.1,
-        "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"]
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "max_length": args.max_length,
+        "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
+        "entropy_weight": args.entropy_weight,
+        "target_epsilon": args.target_epsilon
     }
     
     # Setup checkpoint directory
@@ -610,7 +646,8 @@ def main():
     
     model = AutoModelForCausalLM.from_pretrained(
         config["model_name"],
-        torch_dtype=torch.float16,
+        # torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,  # better?
         device_map="auto"
     )
     
@@ -623,6 +660,12 @@ def main():
         target_modules=config["target_modules"]
     )
     model = get_peft_model(model, lora_config)
+
+    # enable gradient checkpointing to allow larger batch sizes?
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()  # Required for LoRA with gradient checkpointing
+
+
     
     # Create datasets and dataloaders
     train_dataset = CoherenceDataset(config["data_path"], tokenizer, split='train', 
@@ -778,6 +821,7 @@ def main():
                     log_dict.update({
                         "train/mean_violation": train_metrics['mean_violation'],
                         "train/mean_sum": train_metrics['mean_sum'],
+                        # overfitting gap = diff between train and val (larger gap = more overfitting)
                         "overfitting/violation_gap": train_metrics['mean_violation'] - epoch_metrics['mean_violation'],
                         "overfitting/sum_gap": train_metrics['mean_sum'] - epoch_metrics['mean_sum']
                     })

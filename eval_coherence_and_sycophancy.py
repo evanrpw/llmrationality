@@ -313,6 +313,8 @@ def main():
     else:
         print("No checkpoint provided, evaluating base model")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="left")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     half_model_name = args.model_name.split('/')[1] # e.g. "Qwen3-8B"
     save_path_prefix = f"results/{half_model_name}/{args.checkpoint_tag}"

@@ -44,6 +44,22 @@ def load_checkpoint(checkpoint_path, model, optimizer=None):
         optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
 
 
+def get_num_trailing_template_tokens(tokenizer):
+    # Create a dummy message to get the number of trailing tokens added by the chat template
+    input_ids = tokenizer.apply_chat_template(
+        [[{"role": "user", "content": "?"}]],
+        add_generation_prompt=False,
+        enable_thinking=False,
+        return_tensors='pt',
+        padding=True,
+    )
+    input_ids = input_ids[0]
+    # get number of tokens after the '?' token
+    question_token_id = tokenizer.convert_tokens_to_ids("?")
+    question_token_index = (input_ids == question_token_id).nonzero(as_tuple=True)[0].item()
+    n_trailing_tokens = input_ids.shape[0] - (question_token_index + 1)
+    return n_trailing_tokens
+
 def inference(model, tokenizer, msgss, max_new_tokens=256, is_prefix_injection=False, do_get_probs=False):
     torch.manual_seed(17)
 
@@ -53,6 +69,9 @@ def inference(model, tokenizer, msgss, max_new_tokens=256, is_prefix_injection=F
     if do_get_probs:
         probs = torch.zeros(len(msgss), model.config.vocab_size, dtype=torch.float16)
     
+    if is_prefix_injection:
+        n_trailing_tok = get_num_trailing_template_tokens(tokenizer)
+
     pbar = tqdm(total=len(msgss))
     for cur_prompt_i in range(batch_size, len(msgss) + batch_size, batch_size):
         input_ids = tokenizer.apply_chat_template(
@@ -63,7 +82,7 @@ def inference(model, tokenizer, msgss, max_new_tokens=256, is_prefix_injection=F
             padding=True,
         ).to(model.device)
         if is_prefix_injection:
-            input_ids = input_ids[:, :-2]
+            input_ids = input_ids[:, :-n_trailing_tok]
 
         outputs = model.generate(
             input_ids=input_ids,
